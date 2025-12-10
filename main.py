@@ -2,297 +2,212 @@ import os
 import logging
 import requests
 import threading
-import tempfile
+import asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
-from telegram.error import TelegramError
-from urllib.parse import urlparse
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+import re
+from urllib.parse import unquote
 
-# --- إعدادات البوت ---
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise ValueError("❌ TELEGRAM_TOKEN غير موجود في متغيرات البيئة!")
-
-# --- إعدادات Flask (لإبقاء السيرفر يعمل على Render) ---
-app = Flask(__name__)
-
-@app.route('/')
-def health_check():
-    return "Bot is running!"
-
-def run_flask():
-    """تشغيل Flask في خيط منفصل"""
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
-
-# --- إعداد التسجيل للأخطاء ---
+# --- إعدادات التسجيل ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- دوال مساعدة لاستخراج اسم الملف ---
-def get_filename_from_url(url):
-    """استخراج اسم الملف من الرابط"""
-    try:
-        parsed_url = urlparse(url)
-        path = parsed_url.path
-        if path:
-            filename = path.split('/')[-1]
-            if filename and '.' in filename:
-                return filename
-        
-        # إذا لم نجد اسم ملف، نستخدم اسمًا افتراضيًا
-        return "downloaded_file.bin"
-    except Exception as e:
-        logger.error(f"خطأ في استخراج اسم الملف: {e}")
-        return "unknown_file.bin"
+# --- إعدادات البوت والبيئة ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+PORT = int(os.environ.get("PORT", 5000))
 
-def is_valid_url(url):
-    """التحقق من صحة الرابط"""
-    try:
-        parsed = urlparse(url)
-        return all([parsed.scheme in ['http', 'https'], parsed.netloc])
-    except:
-        return False
+# --- إعدادات Flask (Keep-Alive) ---
+app = Flask(__name__)
 
-# --- دالة الرفع على Pixeldrain ---
-def upload_to_pixeldrain(file_url, filename):
-    """رفع الملف على Pixeldrain"""
-    try:
-        # إضافة user-agent لتجنب الحجب
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        # تحميل الملف مع stream
-        with requests.get(file_url, stream=True, headers=headers, timeout=30) as r:
-            r.raise_for_status()
-            
-            # إنشاء ملف مؤقت
-            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        tmp_file.write(chunk)
-                
-                tmp_file_path = tmp_file.name
-            
-            # رفع الملف إلى Pixeldrain
-            with open(tmp_file_path, 'rb') as f:
-                response = requests.put(
-                    f"https://pixeldrain.com/api/file/{filename}",
-                    data=f,
-                    auth=('', ''),  # مصادقة فارغة
-                    headers={'User-Agent': 'Telegram-Bot'},
-                    timeout=60
-                )
-            
-            # تنظيف الملف المؤقت
-            os.unlink(tmp_file_path)
-            
-            if response.status_code in [200, 201]:
-                data = response.json()
-                file_id = data.get('id')
-                return True, f"https://pixeldrain.com/u/{file_id}"
-            else:
-                return False, f"خطأ Pixeldrain: {response.status_code}"
-                
-    except requests.exceptions.RequestException as e:
-        return False, f"خطأ في الاتصال: {str(e)}"
-    except Exception as e:
-        logger.error(f"خطأ غير متوقع في Pixeldrain: {e}")
-        return False, f"خطأ داخلي: {str(e)}"
+@app.route('/')
+def health_check():
+    return "Bot is running and healthy!"
 
-# --- دالة الرفع على GoFile (الخيار البديل) ---
-def upload_to_gofile(file_url, filename):
-    """رفع الملف على GoFile"""
-    try:
-        # 1. الحصول على أفضل سيرفر
-        server_req = requests.get("https://api.gofile.io/getServer", timeout=10)
-        server_data = server_req.json()
-        
-        if server_data.get('status') != 'ok':
-            return False, "تعذر الحصول على خادم GoFile"
-            
-        server = server_data['data']['server']
-        
-        # 2. تحميل الملف إلى ملف مؤقت
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        with requests.get(file_url, stream=True, headers=headers, timeout=30) as r:
-            r.raise_for_status()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix='_'+filename) as tmp_file:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        tmp_file.write(chunk)
-                tmp_file_path = tmp_file.name
-        
-        # 3. رفع الملف إلى GoFile
-        upload_url = f"https://{server}.gofile.io/uploadFile"
-        
-        with open(tmp_file_path, 'rb') as f:
-            files = {'file': (filename, f)}
-            response = requests.post(upload_url, files=files, timeout=60)
-        
-        # تنظيف الملف المؤقت
-        os.unlink(tmp_file_path)
-        
-        if response.status_code == 200:
-            resp_json = response.json()
-            if resp_json.get('status') == 'ok':
-                return True, resp_json['data']['downloadPage']
-            else:
-                return False, "فشل رفع GoFile"
-        else:
-            return False, f"خطأ GoFile: {response.status_code}"
-            
-    except requests.exceptions.RequestException as e:
-        return False, f"خطأ في الاتصال: {str(e)}"
-    except Exception as e:
-        logger.error(f"خطأ غير متوقع في GoFile: {e}")
-        return False, f"خطأ داخلي: {str(e)}"
+def run_flask():
+    # إيقاف رسائل الفلاسك المزعجة في اللوج
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=PORT)
 
-# --- معالجة رسائل التليجرام ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة أمر /start"""
-    welcome_text = """
-👋 **أهلاً بك في بوت رفع الملفات!**
-
-📤 **كيفية الاستخدام:**
-1. أرسل لي رابط تحميل مباشر (Direct Link)
-2. سأقوم برفعه لك على Pixeldrain
-3. إذا فشل، سأرفعه على GoFile تلقائياً
-
-⚡ **مميزات البوت:**
-- رفع الملفات الكبيرة دون استهلاك باقتك
-- دعم جميع أنواع الملفات
-- روابط دائمة
-
-🔗 **مثال:**
-`https://example.com/file.zip`
-
-🚀 ابدأ الآن بإرسال رابط!
+# --- دوال مساعدة ---
+def get_filename(response, url):
     """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الروابط المرسلة"""
-    url = update.message.text.strip()
-    
-    if not is_valid_url(url):
-        await update.message.reply_text(
-            "❌ **رابط غير صالح!**\n"
-            "الرجاء إرسال رابط يبدأ بـ http:// أو https://",
-            parse_mode='Markdown'
-        )
-        return
-    
-    # إعلام المستخدم ببدء المعالجة
-    status_msg = await update.message.reply_text(
-        "⏳ **جارٍ معالجة طلبك...**\n"
-        "1️⃣ جاري سحب الملف من الرابط\n"
-        "2️⃣ سيتم رفعه على Pixeldrain",
-        parse_mode='Markdown'
-    )
-    
-    filename = get_filename_from_url(url)
-    
-    # المحاولة الأولى: Pixeldrain
-    await status_msg.edit_text(
-        "⏳ **جارٍ معالجة طلبك...**\n"
-        "✅ تم سحب الملف بنجاح\n"
-        "⬆️ جاري الرفع على Pixeldrain...",
-        parse_mode='Markdown'
-    )
-    
-    success, link = upload_to_pixeldrain(url, filename)
-    
-    if success:
-        await status_msg.edit_text(
-            f"✅ **تم الرفع بنجاح على Pixeldrain!**\n\n"
-            f"📂 **اسم الملف:** `{filename}`\n"
-            f"🔗 **الرابط:** {link}\n"
-            f"📊 **المشاركة:** شارك الرابط مع أصدقائك!",
-            parse_mode='Markdown'
-        )
-    else:
-        # المحاولة الثانية: GoFile
-        await status_msg.edit_text(
-            "⏳ **جارٍ معالجة طلبك...**\n"
-            "⚠️ فشل Pixeldrain\n"
-            "🔄 جاري المحاولة على GoFile...",
-            parse_mode='Markdown'
-        )
-        
-        success_go, link_go = upload_to_gofile(url, filename)
-        
-        if success_go:
-            await status_msg.edit_text(
-                f"✅ **تم الرفع بنجاح على GoFile!**\n\n"
-                f"📂 **اسم الملف:** `{filename}`\n"
-                f"🔗 **الرابط:** {link_go}\n"
-                f"📊 **المشاركة:** شارك الرابط مع أصدقائك!",
-                parse_mode='Markdown'
-            )
-        else:
-            await status_msg.edit_text(
-                f"❌ **فشل الرفع على كلا الموقعين**\n\n"
-                f"**تفاصيل الخطأ:**\n"
-                f"• Pixeldrain: {link}\n"
-                f"• GoFile: {link_go}\n\n"
-                f"⚠️ **تلميحات:**\n"
-                f"1. تأكد من صحة الرابط\n"
-                f"2. حاول برابط ملف أصغر\n"
-                f"3. جرب رابطًا آخر",
-                parse_mode='Markdown'
-            )
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة الأخطاء العامة"""
-    logger.error(f"حدث خطأ: {context.error}")
-    
-    if update and update.effective_message:
+    محاولة ذكية لاستخراج اسم الملف من الهيدر أو الرابط
+    """
+    filename = None
+    # 1. المحاولة من Content-Disposition
+    if "Content-Disposition" in response.headers:
+        cd = response.headers["Content-Disposition"]
+        fnames = re.findall('filename="?([^"]+)"?', cd)
+        if fnames:
+            filename = fnames[0]
+            
+    # 2. المحاولة من الرابط إذا فشل الهيدر
+    if not filename:
         try:
-            await update.effective_message.reply_text(
-                "❌ حدث خطأ غير متوقع. الرجاء المحاولة مرة أخرى لاحقاً."
-            )
+            filename = url.split("/")[-1].split("?")[0]
+            filename = unquote(filename) # فك تشفير الرموز مثل %20
         except:
             pass
+            
+    # 3. اسم افتراضي
+    if not filename or not "." in filename:
+        filename = "downloaded_file.bin"
+        
+    return filename
 
-# --- تشغيل البوت ---
-def main():
-    """الدالة الرئيسية لتشغيل البوت"""
-    # تشغيل Flask في خيط منفصل
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+# --- دالة الرفع على Pixeldrain (استهلاك رام شبه معدوم) ---
+def upload_to_pixeldrain(target_url):
+    try:
+        # فتح اتصال مع الملف المصدر (Stream)
+        with requests.get(target_url, stream=True, timeout=20) as r_source:
+            r_source.raise_for_status()
+            filename = get_filename(r_source, target_url)
+            
+            # Pixeldrain يقبل الرفع المباشر عبر PUT (Streamed Upload)
+            # نستخدم المولد (Generator) لرفع البيانات قطعة بقطعة
+            response = requests.put(
+                f"https://pixeldrain.com/api/file/{filename}",
+                data=r_source.iter_content(chunk_size=8192), # قطع صغيرة جداً 8KB
+                auth=('', ''),
+                timeout=3600 # ساعة مهلة للملفات الكبيرة
+            )
+            
+            if response.status_code == 201:
+                data = response.json()
+                return True, filename, f"https://pixeldrain.com/u/{data.get('id')}"
+            else:
+                return False, filename, f"Pixeldrain Error: {response.status_code}"
+    except Exception as e:
+        return False, "Unknown", str(e)
+
+# --- دالة الرفع على GoFile (باستخدام requests-toolbelt لتوفير الرام) ---
+def upload_to_gofile(target_url, filename_hint):
+    try:
+        # 1. الحصول على السيرفر
+        server_req = requests.get("https://api.gofile.io/getServer", timeout=10)
+        server_data = server_req.json()
+        if server_data['status'] != 'ok':
+            return False, "GoFile Server Error"
+        
+        server = server_data['data']['server']
+        upload_url = f"https://{server}.gofile.io/uploadFile"
+
+        # 2. بدء الرفع المتدفق
+        with requests.get(target_url, stream=True, timeout=20) as r_source:
+            r_source.raise_for_status()
+            
+            # استخدام MultipartEncoder لإنشاء تدفق مباشر دون تحميل الملف في الرام
+            m = MultipartEncoder(
+                fields={
+                    'file': (filename_hint, r_source.raw, r_source.headers.get('Content-Type', 'application/octet-stream'))
+                }
+            )
+            
+            # الرفع
+            response = requests.post(
+                upload_url,
+                data=m,
+                headers={'Content-Type': m.content_type},
+                timeout=3600
+            )
+            
+            resp_json = response.json()
+            if resp_json['status'] == 'ok':
+                return True, resp_json['data']['downloadPage']
+            else:
+                return False, "GoFile Upload Failed"
+
+    except Exception as e:
+        return False, str(e)
+
+# --- معالج العمليات الثقيلة (لتشغيلها في الخلفية) ---
+def process_upload(url):
+    # نحاول أولاً Pixeldrain
+    success, filename, result = upload_to_pixeldrain(url)
     
-    logger.info("🚀 بدء تشغيل بوت التليجرام...")
+    if success:
+        return True, "Pixeldrain", filename, result
     
-    # إنشاء تطبيق البوت
-    application = ApplicationBuilder() \
-        .token(TOKEN) \
-        .connect_timeout(30) \
-        .read_timeout(30) \
-        .write_timeout(30) \
-        .build()
+    # إذا فشل، نحاول GoFile
+    # نستخدم الاسم الذي استخرجناه في المحاولة الأولى إذا وجد
+    fname_for_go = filename if filename != "Unknown" else "file.bin"
+    success_go, result_go = upload_to_gofile(url, fname_for_go)
     
-    # إضافة المعالجات
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    if success_go:
+        return True, "GoFile", fname_for_go, result_go
     
-    # إضافة معالج الأخطاء
-    application.add_error_handler(error_handler)
-    
-    # تشغيل البوت
-    logger.info("🤖 البوت يعمل الآن...")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        timeout=20,
-        poll_interval=0.5
+    return False, "Failed", fname_for_go, f"Pixeldrain: {result} | GoFile: {result_go}"
+
+# --- التفاعلات مع التليجرام ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 **مرحباً بك في بوت الرفع السحابي**\n\n"
+        "🚀 **طريقة العمل:** أرسل لي رابطاً مباشراً، وسأقوم برفعه لك على Pixeldrain (أو GoFile كبديل).\n"
+        "💡 **المميزات:** لا أستهلك من باقتك، وأعمل بكفاءة عالية.",
+        parse_mode='Markdown'
     )
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    
+    if not url.startswith(('http://', 'https://')):
+        await update.message.reply_text("❌ الرابط غير صالح.")
+        return
+
+    status_msg = await update.message.reply_text("⏳ **بدء الاتصال بالسيرفر...**", parse_mode='Markdown')
+
+    # تشغيل عملية الرفع في Thread منفصل لعدم تجميد البوت (Asyncio Executor)
+    loop = asyncio.get_running_loop()
+    
+    try:
+        # استخدام run_in_executor لتشغيل الكود المتزامن (blocking) بشكل غير متزامن
+        success, host, fname, link = await loop.run_in_executor(None, process_upload, url)
+        
+        if success:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text=f"✅ **تم الرفع بنجاح!**\n\n"
+                     f"☁️ السيرفر: {host}\n"
+                     f"📂 الملف: `{fname}`\n"
+                     f"🔗 الرابط: {link}",
+                parse_mode='Markdown'
+            )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=status_msg.message_id,
+                text=f"❌ **فشلت العملية**\n\nالسبب:\n{link}"
+            )
+    except Exception as e:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text=f"❌ حدث خطأ غير متوقع: {str(e)}"
+        )
+
+# --- التشغيل الرئيسي ---
 if __name__ == '__main__':
-    main()
+    # 1. تشغيل سيرفر Flask في خيط منفصل
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True # يغلق تلقائياً عند إغلاق البوت
+    flask_thread.start()
+
+    # 2. التحقق من التوكن وتشغيل البوت
+    if not TOKEN:
+        print("❌ Error: TELEGRAM_TOKEN variable is missing!")
+    else:
+        print("✅ Bot is starting...")
+        application = ApplicationBuilder().token(TOKEN).build()
+        
+        application.add_handler(CommandHandler('start', start))
+        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+        
+        application.run_polling()
