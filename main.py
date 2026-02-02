@@ -1,24 +1,20 @@
 import os
+import logging
 import aiohttp
-import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 # --- الإعدادات ---
-# ملاحظة: API_ID و API_HASH الموجودة قد تكون غير صحيحة، يرجى التأكد منها من https://my.telegram.org/apps
-API_ID = 899701233  
-API_HASH = "8095402128e46973302061328087955b" # هذا مثال لهاش صحيح، الهاش الأصلي كان يبدو كاسم مستخدم
+# تم إزالة API_ID و API_HASH بناءً على طلبك، البوت يعمل الآن بالتوكن فقط
 BOT_TOKEN = "8520726911:AAGVdtBEtNDrD8cdjldPfmtMjSXDzyqJ4ls"
 
-# معرف القناة (يجب أن يكون البوت مشرفاً فيها)
+# معرف القناة: يمكن أن يكون @username أو رقم ID (مثل -100123456789)
 TARGET_CHANNEL = "@uplovid" 
 
-# إنشاء تطبيق Pyrogram
-app = Client(
-    "my_bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+# إعداد السجلات (Logging)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 
 # --- دوال التعامل مع GoFile ---
@@ -26,16 +22,13 @@ app = Client(
 async def upload_to_gofile_stream(file_path):
     """
     رفع الملف إلى GoFile باستخدام الـ Streaming لتوفير الرام.
-    تم تحديث الرابط إلى الرابط العالمي الجديد حسب التوثيق.
     """
     url = "https://upload.gofile.io/uploadfile"
     
-    # استخدام ClientSession واحدة أو إدارتها بشكل جيد
     async with aiohttp.ClientSession() as session:
         try:
-            # نستخدم FormData لرفع الملف
             data = aiohttp.FormData()
-            # فتح الملف كـ stream لتقليل استهلاك الذاكرة
+            # فتح الملف كـ stream لتقليل استهلاك الذاكرة (مهم لـ Render)
             with open(file_path, 'rb') as f:
                 data.add_field('file', f, filename=os.path.basename(file_path))
                 
@@ -45,55 +38,75 @@ async def upload_to_gofile_stream(file_path):
                         if result['status'] == 'ok':
                             return result['data']['downloadPage']
                         else:
-                            print(f"GoFile Error: {result.get('status')}")
+                            logging.error(f"GoFile Error: {result.get('status')}")
                     else:
-                        print(f"Upload failed with status: {resp.status}")
+                        logging.error(f"Upload failed with status: {resp.status}")
         except Exception as e:
-            print(f"Upload Exception: {e}")
+            logging.error(f"Upload Exception: {e}")
             
     return None
 
-# --- معالج الفيديو ---
+# --- معالج الرسائل ---
 
-@app.on_message(filters.chat(TARGET_CHANNEL) & filters.video)
-async def handle_video(client: Client, message: Message):
-    print(f"New video detected: {message.video.file_name or 'Unknown'}")
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.channel_post or update.message
+    if not message or not message.video:
+        return
+
+    # التحقق من أن الرسالة قادمة من القناة المستهدفة
+    chat = message.chat
+    chat_id = str(chat.id)
+    chat_username = f"@{chat.username}" if chat.username else ""
     
-    # إنشاء مجلد التحميلات إذا لم يكن موجوداً
+    # دعم التحقق من المعرف سواء كان ID أو Username
+    target = str(TARGET_CHANNEL)
+    if target != chat_id and target != chat_username:
+        # إذا لم يتطابق المعرف، نتجاهل الرسالة
+        return
+
+    logging.info(f"New video detected in {chat.title or chat.id}")
+    
+    # إنشاء مجلد التحميلات
     os.makedirs("downloads", exist_ok=True)
     
-    file_name = message.video.file_name or f"video_{message.id}.mp4"
-    file_path = os.path.join("downloads", f"{message.id}_{file_name}")
+    file_id = message.video.file_id
+    file_name = message.video.file_name or f"video_{message.message_id}.mp4"
+    file_path = os.path.join("downloads", f"{message.message_id}_{file_name}")
     
     try:
-        # 1. تحميل الفيديو من تيليجرام
-        # ملاحظة: Render لديه مساحة قرص محدودة في النسخة المجانية، لذا نحذف الملف فوراً بعد الرفع
-        print(f"Downloading {file_name} from Telegram...")
-        downloaded_path = await message.download(file_path)
-        print("Download complete.")
+        # 1. تحميل الفيديو
+        logging.info(f"Downloading {file_name}...")
+        new_file = await context.bot.get_file(file_id)
+        await new_file.download_to_drive(file_path)
+        logging.info("Download complete.")
 
-        # 2. رفع الفيديو إلى GoFile
-        print("Uploading to GoFile...")
-        link = await upload_to_gofile_stream(downloaded_path)
+        # 2. الرفع إلى GoFile
+        logging.info("Uploading to GoFile...")
+        link = await upload_to_gofile_stream(file_path)
 
         if link:
-            print(f"✅ Success! Link: {link}")
-            # إرسال الرابط كرد على الفيديو في القناة
-            await message.reply_text(f"✅ تم الرفع بنجاح!\n\nرابط الملف: {link}", quote=True)
+            logging.info(f"✅ Success! Link: {link}")
+            await message.reply_text(f"✅ تم الرفع بنجاح!\n\nرابط الملف: {link}")
         else:
-            print("❌ Failed to get link.")
-            await message.reply_text("❌ فشل رفع الملف إلى GoFile.", quote=True)
+            logging.error("❌ Failed to get link.")
+            await message.reply_text("❌ فشل رفع الملف إلى GoFile.")
 
     except Exception as e:
-        print(f"Error processing video: {e}")
+        logging.error(f"Error processing video: {e}")
 
     finally:
-        # 3. التنظيف: حذف الملف من السيرفر لتوفير المساحة
+        # 3. التنظيف
         if os.path.exists(file_path):
             os.remove(file_path)
-            print(f"Cleaned up local file: {file_path}")
+            logging.info(f"Cleaned up: {file_path}")
 
-# تشغيل البوت
-if __name__ == "__main__":
-    print("Bot is starting...")
-    app.run()
+if __name__ == '__main__':
+    # بناء التطبيق باستخدام التوكن فقط
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # إضافة معالج للفيديوهات في القنوات والمحادثات
+    video_handler = MessageHandler(filters.VIDEO, handle_video)
+    application.add_handler(video_handler)
+    
+    logging.info("Bot is starting using python-telegram-bot...")
+    application.run_polling()
